@@ -1,5 +1,16 @@
 import { describe, expect, it, vi } from "vitest";
 
+vi.mock("../web/media.js", async () => {
+  const actual = await vi.importActual<typeof import("../web/media.js")>(
+    "../web/media.js",
+  );
+  return {
+    ...actual,
+    loadWebMedia: vi.fn(),
+  };
+});
+
+import { loadWebMedia } from "../web/media.js";
 import { sendMessageTelegram } from "./send.js";
 
 describe("sendMessageTelegram", () => {
@@ -66,5 +77,41 @@ describe("sendMessageTelegram", () => {
     await expect(
       sendMessageTelegram(chatId, "hi", { token: "tok", api }),
     ).rejects.toThrow(/chat_id=123/);
+  });
+
+  it("sends ogg audio as a voice message", async () => {
+    const chatId = "123";
+    const sendVoice = vi.fn().mockResolvedValue({
+      message_id: 2,
+      chat: { id: chatId },
+    });
+    const sendAudio = vi.fn();
+    const sendDocument = vi.fn();
+    const api = {
+      sendVoice,
+      sendAudio,
+      sendDocument,
+    } as unknown as {
+      sendVoice: typeof sendVoice;
+      sendAudio: typeof sendAudio;
+      sendDocument: typeof sendDocument;
+    };
+    vi.mocked(loadWebMedia).mockResolvedValueOnce({
+      buffer: Buffer.from("audio"),
+      contentType: "audio/ogg",
+      kind: "audio",
+      fileName: "tts.ogg",
+    });
+
+    const res = await sendMessageTelegram(chatId, "hi", {
+      token: "tok",
+      api,
+      mediaUrl: "https://example.com/tts.ogg",
+    });
+
+    expect(sendVoice).toHaveBeenCalledOnce();
+    expect(sendAudio).not.toHaveBeenCalled();
+    expect(sendDocument).not.toHaveBeenCalled();
+    expect(res.messageId).toBe("2");
   });
 });

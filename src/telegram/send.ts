@@ -119,7 +119,12 @@ export async function sendMessageTelegram(
       | Awaited<ReturnType<typeof api.sendPhoto>>
       | Awaited<ReturnType<typeof api.sendVideo>>
       | Awaited<ReturnType<typeof api.sendAudio>>
+      | Awaited<ReturnType<typeof api.sendVoice>>
       | Awaited<ReturnType<typeof api.sendDocument>>;
+    const isVoice = isTelegramVoiceMedia(
+      media.contentType ?? undefined,
+      media.fileName,
+    );
     if (kind === "image") {
       result = await sendWithRetry(
         () => api.sendPhoto(chatId, file, { caption }),
@@ -131,6 +136,13 @@ export async function sendMessageTelegram(
       result = await sendWithRetry(
         () => api.sendVideo(chatId, file, { caption }),
         "video",
+      ).catch((err) => {
+        throw wrapChatNotFound(err);
+      });
+    } else if (kind === "audio" && isVoice) {
+      result = await sendWithRetry(
+        () => api.sendVoice(chatId, file, { caption }),
+        "voice",
       ).catch((err) => {
         throw wrapChatNotFound(err);
       });
@@ -193,5 +205,17 @@ function inferFilename(kind: ReturnType<typeof mediaKindFromMime>) {
     default:
       return "file.bin";
   }
+}
+
+function isTelegramVoiceMedia(
+  contentType?: string,
+  fileName?: string,
+): boolean {
+  const mime = contentType?.toLowerCase();
+  if (mime === "audio/ogg") return true;
+  if (mime === "audio/opus") return true;
+  if (mime === "audio/x-opus+ogg") return true;
+  const name = fileName?.toLowerCase() ?? "";
+  return name.endsWith(".ogg") || name.endsWith(".opus");
 }
 // @ts-nocheck
