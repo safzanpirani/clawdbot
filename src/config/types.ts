@@ -426,12 +426,36 @@ export type GroupChatConfig = {
   historyLimit?: number;
 };
 
+export type TranscribeAudioProvider = "command" | "deepgram" | "openai";
+
+export type DeepgramTranscribeConfig = {
+  /** Deepgram API key. Falls back to DEEPGRAM_API_KEY env var. */
+  apiKey?: string;
+  /** Deepgram model to use. Default: "nova-3". */
+  model?: string;
+  /** Language code (e.g., "en", "es"). Used if detectLanguage is false. */
+  language?: string;
+  /** Auto-detect language. Default: false. */
+  detectLanguage?: boolean;
+  /** Add punctuation and capitalization. Default: true. */
+  punctuate?: boolean;
+  /** Smart formatting for dates, times, numbers. Default: true. */
+  smartFormat?: boolean;
+};
+
+export type TranscribeAudioConfig = {
+  /** Transcription provider. Default: "command" for backward compatibility. */
+  provider?: TranscribeAudioProvider;
+  /** CLI command for "command" provider. Templated args, must output transcript to stdout. */
+  command?: string[];
+  /** Deepgram-specific configuration for "deepgram" provider. */
+  deepgram?: DeepgramTranscribeConfig;
+  /** Timeout in seconds. Default: 45. */
+  timeoutSeconds?: number;
+};
+
 export type RoutingConfig = {
-  transcribeAudio?: {
-    // Optional CLI to turn inbound audio into text; templated args, must output transcript to stdout.
-    command: string[];
-    timeoutSeconds?: number;
-  };
+  transcribeAudio?: TranscribeAudioConfig;
   groupChat?: GroupChatConfig;
   queue?: {
     mode?: QueueMode;

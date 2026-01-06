@@ -93,9 +93,28 @@ const QueueModeBySurfaceSchema = z
   })
   .optional();
 
+const DeepgramConfigSchema = z
+  .object({
+    apiKey: z.string().optional(),
+    model: z.string().optional(),
+    language: z.string().optional(),
+    detectLanguage: z.boolean().optional(),
+    punctuate: z.boolean().optional(),
+    smartFormat: z.boolean().optional(),
+  })
+  .optional();
+
 const TranscribeAudioSchema = z
   .object({
-    command: z.array(z.string()),
+    provider: z
+      .union([
+        z.literal("command"),
+        z.literal("deepgram"),
+        z.literal("openai"),
+      ])
+      .optional(),
+    command: z.array(z.string()).optional(),
+    deepgram: DeepgramConfigSchema,
     timeoutSeconds: z.number().int().positive().optional(),
   })
   .optional();
