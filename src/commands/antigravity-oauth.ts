@@ -10,6 +10,7 @@ import { readFileSync } from "node:fs";
 import { stdin, stdout } from "node:process";
 import { createInterface } from "node:readline/promises";
 import { loginAntigravity, type OAuthCredentials } from "@mariozechner/pi-ai";
+import type { AccountTier } from "../agents/antigravity-accounts.js";
 
 // OAuth constants - decoded from pi-ai's base64 encoded values to stay in sync
 const decode = (s: string) => Buffer.from(s, "base64").toString();
@@ -165,7 +166,7 @@ function parseCallbackInput(
 async function exchangeCodeForTokens(
   code: string,
   verifier: string,
-): Promise<OAuthCredentials> {
+): Promise<OAuthCredentialsWithTier> {
   const response = await fetch(TOKEN_URL, {
     method: "POST",
     headers: {
@@ -199,8 +200,8 @@ async function exchangeCodeForTokens(
   // Fetch user email
   const email = await getUserEmail(data.access_token);
 
-  // Fetch project ID
   const projectId = await fetchProjectId(data.access_token);
+  const tier = await fetchAccountTier(data.access_token);
 
   // Calculate expiry time (same as pi-ai: current time + expires_in - 5 min buffer)
   const expiresAt = Date.now() + data.expires_in * 1000 - 5 * 60 * 1000;
@@ -211,6 +212,7 @@ async function exchangeCodeForTokens(
     expires: expiresAt,
     projectId,
     email,
+    tier,
   };
 }
 
@@ -299,6 +301,105 @@ async function fetchProjectId(accessToken: string): Promise<string> {
 }
 
 /**
+ * Fetch account tier (free or paid) from Antigravity API.
+ * Returns "paid" if currentTier.id !== "FREE", otherwise "free".
+ */
+export async function fetchAccountTier(
+  accessToken: string,
+): Promise<AccountTier> {
+  const headers = {
+    Authorization: `Bearer ${accessToken}`,
+    "Content-Type": "application/json",
+    "User-Agent": "google-api-nodejs-client/9.15.1",
+    "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
+    "Client-Metadata": JSON.stringify({
+      ideType: "IDE_UNSPECIFIED",
+      platform: "PLATFORM_UNSPECIFIED",
+      pluginType: "GEMINI",
+    }),
+  };
+
+  const endpoints = [
+    "https://cloudcode-pa.googleapis.com",
+    "https://daily-cloudcode-pa.sandbox.googleapis.com",
+  ];
+
+  for (const endpoint of endpoints) {
+    try {
+      const response = await fetch(`${endpoint}/v1internal:loadCodeAssist`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          metadata: {
+            ideType: "IDE_UNSPECIFIED",
+            platform: "PLATFORM_UNSPECIFIED",
+            pluginType: "GEMINI",
+          },
+        }),
+      });
+
+      if (!response.ok) continue;
+
+      const data = (await response.json()) as {
+        allowedTiers?: Array<{ id?: string; isDefault?: boolean }>;
+        paidTier?: { id?: string };
+        currentTier?: { id?: string };
+      };
+
+      const isPaidTierId = (tierId?: string) => {
+        if (!tierId) return false;
+        const normalized = tierId.toLowerCase();
+        if (normalized === "legacy-tier") return false;
+        return !normalized.includes("free") && !normalized.includes("zero");
+      };
+
+      if (isPaidTierId(data.paidTier?.id)) {
+        return "paid";
+      }
+
+      if (Array.isArray(data.allowedTiers)) {
+        const defaultTier = data.allowedTiers.find((tier) => tier.isDefault);
+        if (isPaidTierId(defaultTier?.id)) {
+          return "paid";
+        }
+      }
+
+      if (data.currentTier?.id && data.currentTier.id !== "FREE") {
+        return "paid";
+      }
+
+      return "free";
+    } catch {
+      // ignore failed endpoint, try next
+    }
+  }
+
+  // Default to free if we can't determine
+  return "free";
+}
+
+async function enrichAntigravityCredentials(
+  creds: OAuthCredentials,
+): Promise<OAuthCredentialsWithTier> {
+  const access = creds.access;
+  let projectId = creds.projectId;
+  let tier: AccountTier | undefined;
+
+  if (access) {
+    if (!projectId) {
+      projectId = await fetchProjectId(access);
+    }
+    tier = await fetchAccountTier(access);
+  }
+
+  return {
+    ...creds,
+    projectId: projectId ?? DEFAULT_PROJECT_ID,
+    tier,
+  };
+}
+
+/**
  * Prompt user for input via readline.
  */
 async function promptInput(message: string): Promise<string> {
@@ -319,7 +420,7 @@ async function promptInput(message: string): Promise<string> {
 export async function loginAntigravityVpsAware(
   onUrl: (url: string) => void | Promise<void>,
   onProgress?: (message: string) => void,
-): Promise<OAuthCredentials | null> {
+): Promise<OAuthCredentialsWithTier | null> {
   // Check if we're in a remote environment
   if (shouldUseManualOAuthFlow()) {
     return loginAntigravityManual(onUrl, onProgress);
@@ -327,13 +428,15 @@ export async function loginAntigravityVpsAware(
 
   // Use the standard pi-ai flow for local environments
   try {
-    return await loginAntigravity(
+    const creds = await loginAntigravity(
       async ({ url, instructions }) => {
         await onUrl(url);
         onProgress?.(instructions ?? "Complete sign-in in browser...");
       },
       (msg) => onProgress?.(msg),
     );
+    if (!creds) return null;
+    return await enrichAntigravityCredentials(creds);
   } catch (err) {
     // If the local server fails (e.g., port in use), fall back to manual
     if (
@@ -357,7 +460,7 @@ export async function loginAntigravityVpsAware(
 export async function loginAntigravityManual(
   onUrl: (url: string) => void | Promise<void>,
   onProgress?: (message: string) => void,
-): Promise<OAuthCredentials | null> {
+): Promise<OAuthCredentialsWithTier | null> {
   const { verifier, challenge } = generatePKCESync();
   const authUrl = buildAuthUrl(challenge, verifier);
 
@@ -395,4 +498,36 @@ export async function loginAntigravityManual(
   onProgress?.("Exchanging authorization code for tokens...");
 
   return exchangeCodeForTokens(parsed.code, verifier);
+}
+
+/**
+ * Extended OAuth credentials with tier information.
+ */
+export interface OAuthCredentialsWithTier extends OAuthCredentials {
+  tier?: AccountTier;
+}
+
+/**
+ * Login to Antigravity and also detect the account tier.
+ * Returns credentials with tier information.
+ */
+export async function loginAntigravityWithTier(
+  onUrl: (url: string) => void | Promise<void>,
+  onProgress?: (message: string) => void,
+): Promise<OAuthCredentialsWithTier | null> {
+  const creds = await loginAntigravityVpsAware(onUrl, onProgress);
+  if (!creds) {
+    return null;
+  }
+
+  if (!creds.tier) {
+    onProgress?.("Detecting account tier...");
+    const tier = await fetchAccountTier(creds.access);
+    return {
+      ...creds,
+      tier,
+    };
+  }
+
+  return creds;
 }

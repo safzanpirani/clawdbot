@@ -26,6 +26,7 @@ import { registerModelsCli } from "./models-cli.js";
 import { registerNodesCli } from "./nodes-cli.js";
 import { forceFreePort } from "./ports.js";
 import { registerTuiCli } from "./tui-cli.js";
+import { registerAntigravityCli } from "./antigravity-cli.js";
 
 export { forceFreePort };
 
@@ -422,6 +423,7 @@ Examples:
   registerCronCli(program);
   registerDnsCli(program);
   registerHooksCli(program);
+  registerAntigravityCli(program);
 
   program
     .command("status")

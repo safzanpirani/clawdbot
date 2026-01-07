@@ -9,8 +9,14 @@ import { discoverAuthStorage } from "@mariozechner/pi-coding-agent";
 import { resolveClawdbotAgentDir } from "../agents/agent-paths.js";
 import {
   isRemoteEnvironment,
-  loginAntigravityVpsAware,
+  loginAntigravityWithTier,
+  type OAuthCredentialsWithTier,
 } from "../commands/antigravity-oauth.js";
+import {
+  MAX_ACCOUNTS,
+  persistAntigravityAccounts,
+  resetAntigravityAccountManager,
+} from "../agents/antigravity-accounts.js";
 import { healthCommand } from "../commands/health.js";
 import {
   applyMinimaxConfig,
@@ -295,40 +301,91 @@ export async function runOnboardingWizard(
           ].join("\n"),
       "Google Antigravity OAuth",
     );
-    const spin = prompter.progress("Starting OAuth flow…");
-    let oauthCreds: OAuthCredentials | null = null;
-    try {
-      oauthCreds = await loginAntigravityVpsAware(
-        async (url) => {
-          if (isRemote) {
-            spin.stop("OAuth URL ready");
-            runtime.log(`\nOpen this URL in your LOCAL browser:\n\n${url}\n`);
-          } else {
-            spin.update("Complete sign-in in browser…");
-            await openUrl(url);
-            runtime.log(`Open: ${url}`);
-          }
-        },
-        (msg) => spin.update(msg),
+
+    resetAntigravityAccountManager();
+    const accounts: OAuthCredentialsWithTier[] = [];
+    let addMoreAccounts = true;
+    while (addMoreAccounts && accounts.length < MAX_ACCOUNTS) {
+      const spin = prompter.progress(
+        accounts.length === 0
+          ? "Starting OAuth flow…"
+          : `Adding account ${accounts.length + 1}…`,
       );
-      spin.stop("Antigravity OAuth complete");
-      if (oauthCreds) {
-        await writeOAuthCredentials("google-antigravity", oauthCreds);
-        nextConfig = {
-          ...nextConfig,
-          agent: {
-            ...nextConfig.agent,
-            model: "google-antigravity/claude-opus-4-5-thinking",
+      let oauthCreds: OAuthCredentialsWithTier | null = null;
+      try {
+        oauthCreds = await loginAntigravityWithTier(
+          async (url: string) => {
+            if (isRemote) {
+              spin.stop("OAuth URL ready");
+              runtime.log(`\nOpen this URL in your LOCAL browser:\n\n${url}\n`);
+            } else {
+              spin.update("Complete sign-in in browser…");
+              await openUrl(url);
+              runtime.log(`Open: ${url}`);
+            }
           },
-        };
-        await prompter.note(
-          "Default model set to google-antigravity/claude-opus-4-5-thinking",
-          "Model configured",
+          (msg: string) => spin.update(msg),
         );
+        spin.stop("Antigravity OAuth complete");
+
+        if (!oauthCreds) {
+          addMoreAccounts = false;
+          continue;
+        }
+
+        accounts.push(oauthCreds);
+
+        const tierLabel = oauthCreds.tier === "paid" ? " (paid)" : " (free)";
+        await prompter.note(
+          `Account ${accounts.length}: ${oauthCreds.email ?? "unknown"}${tierLabel}`,
+          "Account added",
+        );
+
+        if (accounts.length < MAX_ACCOUNTS) {
+          addMoreAccounts = Boolean(
+            await prompter.confirm({
+              message: `Add another Antigravity account? (${accounts.length}/${MAX_ACCOUNTS})`,
+              initialValue: false,
+            }),
+          );
+        } else {
+          addMoreAccounts = false;
+        }
+      } catch (err) {
+        spin.stop("Antigravity OAuth failed");
+        runtime.error(String(err));
+        addMoreAccounts = false;
       }
-    } catch (err) {
-      spin.stop("Antigravity OAuth failed");
-      runtime.error(String(err));
+    }
+
+    if (accounts.length > 0) {
+      const activeAccount = await persistAntigravityAccounts(accounts);
+      const fallback = accounts[0];
+      const activeCreds: OAuthCredentials = activeAccount
+        ? {
+            refresh: activeAccount.refreshToken,
+            access: activeAccount.access ?? fallback.access,
+            expires: activeAccount.expires ?? fallback.expires,
+            projectId: activeAccount.projectId ?? fallback.projectId,
+            email: activeAccount.email ?? fallback.email,
+          }
+        : fallback;
+      await writeOAuthCredentials("google-antigravity", activeCreds);
+
+      nextConfig = {
+        ...nextConfig,
+        agent: {
+          ...nextConfig.agent,
+          model: "google-antigravity/claude-opus-4-5-thinking",
+        },
+      };
+      await prompter.note(
+        [
+          `${accounts.length} account(s) configured for load balancing.`,
+          "Default model set to google-antigravity/claude-opus-4-5-thinking",
+        ].join("\n"),
+        "Antigravity configured",
+      );
     }
   } else if (authChoice === "apiKey") {
     const key = await prompter.text({

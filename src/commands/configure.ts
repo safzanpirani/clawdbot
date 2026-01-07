@@ -13,6 +13,11 @@ import {
 import { loginAnthropic, type OAuthCredentials } from "@mariozechner/pi-ai";
 import type { ClawdbotConfig } from "../config/config.js";
 import {
+  MAX_ACCOUNTS,
+  persistAntigravityAccounts,
+  resetAntigravityAccountManager,
+} from "../agents/antigravity-accounts.js";
+import {
   CONFIG_PATH_CLAWDBOT,
   readConfigFileSnapshot,
   resolveGatewayPort,
@@ -29,6 +34,7 @@ import { createClackPrompter } from "../wizard/clack-prompter.js";
 import {
   isRemoteEnvironment,
   loginAntigravityVpsAware,
+  type OAuthCredentialsWithTier,
 } from "./antigravity-oauth.js";
 import { healthCommand } from "./health.js";
 import {
@@ -297,25 +303,50 @@ async function promptAuthConfig(
       "Google Antigravity OAuth",
     );
     const spin = spinner();
-    spin.start("Starting OAuth flow…");
-    let oauthCreds: OAuthCredentials | null = null;
+    resetAntigravityAccountManager();
+    const accounts: OAuthCredentialsWithTier[] = [];
     try {
-      oauthCreds = await loginAntigravityVpsAware(
-        async (url) => {
-          if (isRemote) {
-            spin.stop("OAuth URL ready");
-            runtime.log(`\nOpen this URL in your LOCAL browser:\n\n${url}\n`);
-          } else {
-            spin.message("Complete sign-in in browser…");
-            await openUrl(url);
-            runtime.log(`Open: ${url}`);
-          }
-        },
-        (msg) => spin.message(msg),
-      );
-      spin.stop("Antigravity OAuth complete");
-      if (oauthCreds) {
-        await writeOAuthCredentials("google-antigravity", oauthCreds);
+      let shouldContinue = true;
+      while (shouldContinue && accounts.length < MAX_ACCOUNTS) {
+        spin.start("Starting OAuth flow…");
+        const oauthCreds = await loginAntigravityVpsAware(
+          async (url) => {
+            if (isRemote) {
+              spin.stop("OAuth URL ready");
+              runtime.log(`\nOpen this URL in your LOCAL browser:\n\n${url}\n`);
+            } else {
+              spin.message("Complete sign-in in browser…");
+              await openUrl(url);
+              runtime.log(`Open: ${url}`);
+            }
+          },
+          (msg) => spin.message(msg),
+        );
+        spin.stop("Antigravity OAuth complete");
+        if (!oauthCreds) break;
+        accounts.push(oauthCreds);
+        if (accounts.length >= MAX_ACCOUNTS) break;
+        const addAnother = guardCancel(
+          await confirm({
+            message: `You have ${accounts.length} account(s) configured. Add another?`,
+          }),
+          runtime,
+        );
+        shouldContinue = Boolean(addAnother);
+      }
+      if (accounts.length > 0) {
+        const activeAccount = await persistAntigravityAccounts(accounts);
+        const fallback = accounts[0];
+        const activeCreds: OAuthCredentials = activeAccount
+          ? {
+              refresh: activeAccount.refreshToken,
+              access: activeAccount.access ?? fallback.access,
+              expires: activeAccount.expires ?? fallback.expires,
+              projectId: activeAccount.projectId ?? fallback.projectId,
+              email: activeAccount.email ?? fallback.email,
+            }
+          : fallback;
+        await writeOAuthCredentials("google-antigravity", activeCreds);
         // Set default model to Claude Opus 4.5 via Antigravity
         next = {
           ...next,
