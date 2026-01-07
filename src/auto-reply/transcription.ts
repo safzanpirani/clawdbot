@@ -96,8 +96,10 @@ export async function transcribeInboundAudio(
     tmpPath = resolved.tmpPath;
 
     switch (provider) {
-      case "deepgram":
-        return await transcribeWithDeepgram(mediaPath, transcriber.deepgram);
+      case "deepgram": {
+        const timeoutMs = Math.max((transcriber.timeoutSeconds ?? 45) * 1000, 1_000);
+        return await transcribeWithDeepgram(mediaPath, transcriber.deepgram, timeoutMs);
+      }
 
       case "openai":
         runtime.error?.("OpenAI transcription provider not yet implemented");

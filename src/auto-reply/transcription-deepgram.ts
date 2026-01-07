@@ -23,6 +23,7 @@ function getClient(apiKey?: string): DeepgramClient {
 export async function transcribeWithDeepgram(
   filePath: string,
   config: DeepgramTranscribeConfig = {},
+  timeoutMs: number = 45_000,
 ): Promise<{ text: string } | undefined> {
   const client = getClient(config.apiKey);
 
@@ -30,11 +31,11 @@ export async function transcribeWithDeepgram(
 
   if (shouldLogVerbose()) {
     logVerbose(
-      `Transcribing with Deepgram (${(audioBuffer.length / 1024).toFixed(1)}KB, model=${config.model ?? "nova-3"})`,
+      `Transcribing audio via Deepgram (${(audioBuffer.length / 1024).toFixed(1)}KB, model=${config.model ?? "nova-3"})`,
     );
   }
 
-  const { result, error } = await client.listen.prerecorded.transcribeFile(
+  const transcribePromise = client.listen.prerecorded.transcribeFile(
     audioBuffer,
     {
       model: config.model ?? "nova-3",
@@ -44,6 +45,12 @@ export async function transcribeWithDeepgram(
       smart_format: config.smartFormat ?? true,
     },
   );
+
+  const timeoutPromise = new Promise<never>((_, reject) =>
+    setTimeout(() => reject(new Error("Deepgram transcription timed out")), timeoutMs),
+  );
+
+  const { result, error } = await Promise.race([transcribePromise, timeoutPromise]);
 
   if (error) {
     throw new Error(`Deepgram transcription failed: ${error.message}`);
@@ -57,7 +64,7 @@ export async function transcribeWithDeepgram(
   }
 
   if (shouldLogVerbose()) {
-    logVerbose(`Deepgram transcript: "${transcript.slice(0, 100)}..."`);
+    logVerbose(`Deepgram transcript: "${transcript.slice(0, 100)}${transcript.length > 100 ? "..." : ""}"`);
   }
 
   return { text: transcript };
