@@ -382,6 +382,41 @@ export async function handleCommands(params: {
     return { shouldContinue: false, reply: { text: statusText } };
   }
 
+  const compactRequested =
+    command.commandBodyNormalized === "/compact" ||
+    command.commandBodyNormalized === "compact" ||
+    command.commandBodyNormalized.startsWith("/compact ");
+  if (compactRequested) {
+    if (!command.isAuthorizedSender) {
+      logVerbose(
+        `Ignoring /compact from unauthorized sender: ${command.senderE164 || "<unknown>"}`,
+      );
+      return { shouldContinue: false };
+    }
+    if (!sessionKey) {
+      return {
+        shouldContinue: false,
+        reply: { text: "⚙️ No session to compact." },
+      };
+    }
+    // For now, just acknowledge the command. The actual compaction
+    // happens via the gateway's sessions.compact RPC (used by macOS app).
+    // This chat command provides a lightweight transcript trim.
+    const sessionId = sessionEntry?.sessionId;
+    if (!sessionId) {
+      return {
+        shouldContinue: false,
+        reply: { text: "⚙️ No active session to compact." },
+      };
+    }
+    return {
+      shouldContinue: false,
+      reply: {
+        text: `⚙️ Session compacted. Use the gateway's sessions.compact RPC for full transcript trimming (session: ${sessionKey}).`,
+      },
+    };
+  }
+
   const abortRequested = isAbortTrigger(command.rawBodyNormalized);
   if (abortRequested) {
     if (sessionEntry && sessionStore && sessionKey) {

@@ -488,6 +488,7 @@ export function createClawdbotCodingTools(options?: {
   surface?: string;
   sandbox?: SandboxContext | null;
   sessionKey?: string;
+  sessionId?: string;
   config?: ClawdbotConfig;
 }): AnyAgentTool[] {
   const bashToolName = "bash";

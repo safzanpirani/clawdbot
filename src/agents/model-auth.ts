@@ -519,3 +519,35 @@ export async function getApiKeyForModel(
   }
   throw new Error(`No API key found for provider "${model.provider}"`);
 }
+
+export async function markAntigravityAccountRateLimited(
+  modelId: string,
+  durationMs = 60000,
+): Promise<boolean> {
+  const multiAccountStorage = await loadAccountStorage();
+  if (!multiAccountStorage || multiAccountStorage.accounts.length === 0) {
+    return false;
+  }
+
+  const manager = await getAntigravityAccountManager();
+  const family = getModelFamily(modelId);
+  const activeIndex = multiAccountStorage.activeIndex ?? 0;
+  const accountData = multiAccountStorage.accounts[activeIndex];
+
+  if (!accountData) {
+    return false;
+  }
+
+  const account: ManagedAccount = {
+    ...accountData,
+    index: activeIndex,
+    rateLimitResetTimes: accountData.rateLimitResetTimes ?? {},
+  };
+
+  logInfo(
+    `antigravity: Marking account ${account.email ?? activeIndex} as rate-limited for ${durationMs}ms`,
+  );
+  manager.markRateLimited(account, durationMs, family);
+  await manager.save();
+  return true;
+}

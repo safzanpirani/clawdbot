@@ -262,7 +262,7 @@ export function buildStatusMessage(args: StatusArgs): string {
 export function buildHelpMessage(): string {
   return [
     "ℹ️ Help",
-    "Shortcuts: /new reset | /restart relink",
+    "Shortcuts: /new reset | /restart relink | /compact trim",
     "Options: /think <level> | /verbose on|off | /elevated on|off | /model <id>",
   ].join("\n");
 }

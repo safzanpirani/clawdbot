@@ -26,7 +26,10 @@ import { resolveUserPath } from "../utils.js";
 import { resolveClawdbotAgentDir } from "./agent-paths.js";
 import type { BashElevatedDefaults } from "./bash-tools.js";
 import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "./defaults.js";
-import { getApiKeyForModel } from "./model-auth.js";
+import {
+  getApiKeyForModel,
+  markAntigravityAccountRateLimited,
+} from "./model-auth.js";
 import { ensureClawdbotModelsJson } from "./models-config.js";
 import {
   buildBootstrapContextFiles,
@@ -86,9 +89,27 @@ type EmbeddedPiQueueHandle = {
   queueMessage: (text: string) => Promise<void>;
   isStreaming: () => boolean;
   abort: () => void;
+  requestCompaction: (customInstructions?: string) => void;
+  getCompactionResult: () => {
+    requested: boolean;
+    result?: { success: boolean; summary?: string; error?: string };
+  };
 };
 
 const log = createSubsystemLogger("agent/embedded");
+
+// Activity timeout for Antigravity silent rate-limits (30 seconds)
+const ANTIGRAVITY_ACTIVITY_TIMEOUT_MS = 30_000;
+const ANTIGRAVITY_ACTIVITY_CHECK_INTERVAL_MS = 5_000;
+const ANTIGRAVITY_MAX_RETRIES = 3;
+
+// Custom error for activity timeout (triggers retry with different account)
+class AntigravityActivityTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AntigravityActivityTimeoutError";
+  }
+}
 
 const ACTIVE_EMBEDDED_RUNS = new Map<string, EmbeddedPiQueueHandle>();
 type EmbeddedRunWaiter = {
@@ -142,6 +163,21 @@ export function abortEmbeddedPiRun(sessionId: string): boolean {
   if (!handle) return false;
   handle.abort();
   return true;
+}
+
+export async function compactEmbeddedPiSession(
+  sessionId: string,
+  customInstructions?: string,
+): Promise<{ success: boolean; summary?: string; error?: string }> {
+  const handle = ACTIVE_EMBEDDED_RUNS.get(sessionId);
+  if (!handle) {
+    return { success: false, error: "No active session found" };
+  }
+  handle.requestCompaction(customInstructions);
+  return {
+    success: true,
+    summary: "Compaction scheduled for after current response",
+  };
 }
 
 export function isEmbeddedPiRunActive(sessionId: string): boolean {
@@ -375,6 +411,7 @@ export async function runEmbeddedPiAgent(params: {
           sandbox,
           surface: params.surface,
           sessionKey: params.sessionKey ?? params.sessionId,
+          sessionId: params.sessionId,
           config: params.config,
         });
         const machineName = await getMachineDisplayName();
@@ -417,209 +454,346 @@ export async function runEmbeddedPiAgent(params: {
           tools.filter((t) => !builtInToolNames.has(t.name)),
         );
 
-        const { session } = await createAgentSession({
-          cwd: resolvedWorkspace,
-          agentDir,
-          authStorage,
-          modelRegistry,
-          model,
-          thinkingLevel,
-          systemPrompt,
-          // Built-in tools recognized by pi-coding-agent SDK
-          tools: builtInTools,
-          // Custom clawdbot tools (browser, canvas, nodes, cron, etc.)
-          customTools,
-          sessionManager,
-          settingsManager,
-          skills: promptSkills,
-          contextFiles,
-        });
+        // Retry loop for Antigravity silent rate-limits
+        const isAntigravityProvider = provider === "google-antigravity";
+        const maxRetries = isAntigravityProvider ? ANTIGRAVITY_MAX_RETRIES : 1;
+        let lastRetryError: unknown = null;
 
-        const prior = await sanitizeSessionMessagesImages(
-          session.messages,
-          "session:history",
-        );
-        if (prior.length > 0) {
-          session.agent.replaceMessages(prior);
-        }
-        let aborted = Boolean(params.abortSignal?.aborted);
-        const abortRun = () => {
-          aborted = true;
-          void session.abort();
-        };
-        const queueHandle: EmbeddedPiQueueHandle = {
-          queueMessage: async (text: string) => {
-            await session.steer(text);
-          },
-          isStreaming: () => session.isStreaming,
-          abort: abortRun,
-        };
-        ACTIVE_EMBEDDED_RUNS.set(params.sessionId, queueHandle);
-
-        const {
-          assistantTexts,
-          toolMetas,
-          unsubscribe,
-          waitForCompactionRetry,
-        } = subscribeEmbeddedPiSession({
-          session,
-          runId: params.runId,
-          verboseLevel: params.verboseLevel,
-          shouldEmitToolResult: params.shouldEmitToolResult,
-          onToolResult: params.onToolResult,
-          onBlockReply: params.onBlockReply,
-          blockReplyBreak: params.blockReplyBreak,
-          blockReplyChunking: params.blockReplyChunking,
-          onPartialReply: params.onPartialReply,
-          onAgentEvent: params.onAgentEvent,
-          enforceFinalTag: params.enforceFinalTag,
-        });
-
-        let abortWarnTimer: NodeJS.Timeout | undefined;
-        const abortTimer = setTimeout(
-          () => {
-            log.warn(
-              `embedded run timeout: runId=${params.runId} sessionId=${params.sessionId} timeoutMs=${params.timeoutMs}`,
-            );
-            abortRun();
-            if (!abortWarnTimer) {
-              abortWarnTimer = setTimeout(() => {
-                if (!session.isStreaming) return;
-                log.warn(
-                  `embedded run abort still streaming: runId=${params.runId} sessionId=${params.sessionId}`,
-                );
-              }, 10_000);
-            }
-          },
-          Math.max(1, params.timeoutMs),
-        );
-
-        let messagesSnapshot: AgentMessage[] = [];
-        let sessionIdUsed = session.sessionId;
-        const onAbort = () => {
-          abortRun();
-        };
-        if (params.abortSignal) {
-          if (params.abortSignal.aborted) {
-            onAbort();
-          } else {
-            params.abortSignal.addEventListener("abort", onAbort, {
-              once: true,
-            });
-          }
-        }
-        let promptError: unknown = null;
-        try {
-          const promptStartedAt = Date.now();
-          log.debug(
-            `embedded run prompt start: runId=${params.runId} sessionId=${params.sessionId}`,
-          );
+        for (let attempt = 0; attempt < maxRetries; attempt++) {
           try {
-            await session.prompt(params.prompt);
-          } catch (err) {
-            promptError = err;
-          } finally {
-            log.debug(
-              `embedded run prompt end: runId=${params.runId} sessionId=${params.sessionId} durationMs=${Date.now() - promptStartedAt}`,
+            // Refresh API key for each attempt (picks different account after rate-limit marking)
+            if (attempt > 0) {
+              log.info(
+                `embedded run retry attempt ${attempt + 1}/${maxRetries}: runId=${params.runId} sessionId=${params.sessionId}`,
+              );
+              const freshApiKey = await getApiKeyForModel(model, authStorage);
+              authStorage.setRuntimeApiKey(model.provider, freshApiKey);
+            }
+
+            const { session } = await createAgentSession({
+              cwd: resolvedWorkspace,
+              agentDir,
+              authStorage,
+              modelRegistry,
+              model,
+              thinkingLevel,
+              systemPrompt,
+              // Built-in tools recognized by pi-coding-agent SDK
+              tools: builtInTools,
+              // Custom clawdbot tools (browser, canvas, nodes, cron, etc.)
+              customTools,
+              sessionManager,
+              settingsManager,
+              skills: promptSkills,
+              contextFiles,
+            });
+
+            const prior = await sanitizeSessionMessagesImages(
+              session.messages,
+              "session:history",
             );
-          }
-          await waitForCompactionRetry();
-          messagesSnapshot = session.messages.slice();
-          sessionIdUsed = session.sessionId;
-        } finally {
-          clearTimeout(abortTimer);
-          if (abortWarnTimer) {
-            clearTimeout(abortWarnTimer);
-            abortWarnTimer = undefined;
-          }
-          unsubscribe();
-          if (ACTIVE_EMBEDDED_RUNS.get(params.sessionId) === queueHandle) {
-            ACTIVE_EMBEDDED_RUNS.delete(params.sessionId);
-            notifyEmbeddedRunEnded(params.sessionId);
-          }
-          session.dispose();
-          params.abortSignal?.removeEventListener?.("abort", onAbort);
-        }
-        if (promptError && !aborted) {
-          throw promptError;
-        }
+            if (prior.length > 0) {
+              session.agent.replaceMessages(prior);
+            }
+            let aborted = Boolean(params.abortSignal?.aborted);
+            let pendingCompaction: {
+              requested: boolean;
+              instructions?: string;
+              result?: { success: boolean; summary?: string; error?: string };
+            } = { requested: false };
+            const abortRun = () => {
+              aborted = true;
+              void session.abort();
+            };
+            const queueHandle: EmbeddedPiQueueHandle = {
+              queueMessage: async (text: string) => {
+                await session.steer(text);
+              },
+              isStreaming: () => session.isStreaming,
+              abort: abortRun,
+              requestCompaction: (customInstructions?: string) => {
+                pendingCompaction = {
+                  requested: true,
+                  instructions: customInstructions,
+                };
+              },
+              getCompactionResult: () => ({
+                requested: pendingCompaction.requested,
+                result: pendingCompaction.result,
+              }),
+            };
+            ACTIVE_EMBEDDED_RUNS.set(params.sessionId, queueHandle);
 
-        const lastAssistant = messagesSnapshot
-          .slice()
-          .reverse()
-          .find((m) => (m as AgentMessage)?.role === "assistant") as
-          | AssistantMessage
-          | undefined;
+            // Activity tracking for Antigravity silent rate-limit detection
+            let lastActivityAt = Date.now();
+            let activityTimeoutError: AntigravityActivityTimeoutError | null = null;
+            const isAntigravity = provider === "google-antigravity";
 
-        const usage = lastAssistant?.usage;
-        const agentMeta: EmbeddedPiAgentMeta = {
-          sessionId: sessionIdUsed,
-          provider: lastAssistant?.provider ?? provider,
-          model: lastAssistant?.model ?? model.id,
-          usage: usage
-            ? {
-                input: usage.input,
-                output: usage.output,
-                cacheRead: usage.cacheRead,
-                cacheWrite: usage.cacheWrite,
-                total: usage.totalTokens,
+            const {
+              assistantTexts,
+              toolMetas,
+              unsubscribe,
+              waitForCompactionRetry,
+            } = subscribeEmbeddedPiSession({
+              session,
+              runId: params.runId,
+              verboseLevel: params.verboseLevel,
+              shouldEmitToolResult: params.shouldEmitToolResult,
+              onToolResult: params.onToolResult,
+              onBlockReply: params.onBlockReply,
+              blockReplyBreak: params.blockReplyBreak,
+              blockReplyChunking: params.blockReplyChunking,
+              onPartialReply: params.onPartialReply,
+              onAgentEvent: params.onAgentEvent,
+              enforceFinalTag: params.enforceFinalTag,
+              onActivity: () => {
+                lastActivityAt = Date.now();
+              },
+            });
+
+            // Activity timeout checker for Antigravity (detects silent rate-limits)
+            let activityChecker: NodeJS.Timeout | undefined;
+            if (isAntigravity) {
+              activityChecker = setInterval(() => {
+                const timeSinceActivity = Date.now() - lastActivityAt;
+                if (timeSinceActivity > ANTIGRAVITY_ACTIVITY_TIMEOUT_MS) {
+                  log.warn(
+                    `embedded run no activity for ${timeSinceActivity}ms, aborting: runId=${params.runId} sessionId=${params.sessionId}`,
+                  );
+                  activityTimeoutError = new AntigravityActivityTimeoutError(
+                    `No streaming activity for ${Math.round(
+                      timeSinceActivity / 1000,
+                    )}s - likely silent rate-limit`,
+                  );
+                  abortRun();
+                }
+              }, ANTIGRAVITY_ACTIVITY_CHECK_INTERVAL_MS);
+            }
+
+            let abortWarnTimer: NodeJS.Timeout | undefined;
+            const abortTimer = setTimeout(
+              () => {
+                log.warn(
+                  `embedded run timeout: runId=${params.runId} sessionId=${params.sessionId} timeoutMs=${params.timeoutMs}`,
+                );
+                abortRun();
+                if (!abortWarnTimer) {
+                  abortWarnTimer = setTimeout(() => {
+                    if (!session.isStreaming) return;
+                    log.warn(
+                      `embedded run abort still streaming: runId=${params.runId} sessionId=${params.sessionId}`,
+                    );
+                  }, 10_000);
+                }
+              },
+              Math.max(1, params.timeoutMs),
+            );
+
+            let messagesSnapshot: AgentMessage[] = [];
+            let sessionIdUsed = session.sessionId;
+            const onAbort = () => {
+              abortRun();
+            };
+            if (params.abortSignal) {
+              if (params.abortSignal.aborted) {
+                onAbort();
+              } else {
+                params.abortSignal.addEventListener("abort", onAbort, {
+                  once: true,
+                });
               }
-            : undefined,
-        };
+            }
+            let promptError: unknown = null;
+            try {
+              const promptStartedAt = Date.now();
+              log.debug(
+                `embedded run prompt start: runId=${params.runId} sessionId=${params.sessionId}`,
+              );
+              try {
+                await session.prompt(params.prompt);
+              } catch (err) {
+                promptError = err;
+              } finally {
+                log.debug(
+                  `embedded run prompt end: runId=${params.runId} sessionId=${params.sessionId} durationMs=${Date.now() - promptStartedAt}`,
+                );
+              }
+              await waitForCompactionRetry();
 
-        const replyItems: Array<{ text: string; media?: string[] }> = [];
+              if (pendingCompaction.requested && !aborted) {
+                try {
+                  log.debug(
+                    `embedded run deferred compaction start: runId=${params.runId} sessionId=${params.sessionId}`,
+                  );
+                  const compactResult = await session.compact(
+                    pendingCompaction.instructions,
+                  );
+                  pendingCompaction.result = {
+                    success: true,
+                    summary: compactResult.summary,
+                  };
+                  log.debug(
+                    `embedded run deferred compaction done: runId=${params.runId} sessionId=${params.sessionId}`,
+                  );
+                } catch (err) {
+                  pendingCompaction.result = {
+                    success: false,
+                    error: err instanceof Error ? err.message : String(err),
+                  };
+                  log.warn(
+                    `embedded run deferred compaction failed: runId=${params.runId} sessionId=${params.sessionId} error=${pendingCompaction.result.error}`,
+                  );
+                }
+              }
 
-        const errorText = lastAssistant
-          ? formatAssistantErrorText(lastAssistant)
-          : undefined;
-        if (errorText) replyItems.push({ text: errorText });
+              messagesSnapshot = session.messages.slice();
+              sessionIdUsed = session.sessionId;
+            } finally {
+              clearTimeout(abortTimer);
+              if (abortWarnTimer) {
+                clearTimeout(abortWarnTimer);
+                abortWarnTimer = undefined;
+              }
+              if (activityChecker) {
+                clearInterval(activityChecker);
+                activityChecker = undefined;
+              }
+              unsubscribe();
+              if (ACTIVE_EMBEDDED_RUNS.get(params.sessionId) === queueHandle) {
+                ACTIVE_EMBEDDED_RUNS.delete(params.sessionId);
+                notifyEmbeddedRunEnded(params.sessionId);
+              }
+              session.dispose();
+              params.abortSignal?.removeEventListener?.("abort", onAbort);
+            }
 
-        const inlineToolResults =
-          params.verboseLevel === "on" &&
-          !params.onPartialReply &&
-          !params.onToolResult &&
-          toolMetas.length > 0;
-        if (inlineToolResults) {
-          for (const { toolName, meta } of toolMetas) {
-            const agg = formatToolAggregate(toolName, meta ? [meta] : []);
-            const { text: cleanedText, mediaUrls } = splitMediaFromOutput(agg);
-            if (cleanedText)
+            // Check for activity timeout error first (triggers retry with different account)
+            if (activityTimeoutError) {
+              await markAntigravityAccountRateLimited(modelId, 120000);
+              throw activityTimeoutError;
+            }
+
+            if (promptError && !aborted) {
+              if (provider === "google-antigravity") {
+                const errorMsg =
+                  promptError instanceof Error
+                    ? promptError.message
+                    : String(promptError);
+                const isRateLimitError =
+                  errorMsg.includes("429") ||
+                  errorMsg.includes("rate") ||
+                  errorMsg.includes("quota") ||
+                  errorMsg.includes("limit") ||
+                  errorMsg.includes("timeout") ||
+                  errorMsg.includes("ECONNRESET") ||
+                  errorMsg.includes("ETIMEDOUT");
+                if (isRateLimitError) {
+                  log.warn(
+                    `embedded run marking antigravity account as rate-limited: ${errorMsg}`,
+                  );
+                  await markAntigravityAccountRateLimited(modelId, 120000);
+                }
+              }
+              throw promptError;
+            }
+
+            const lastAssistant = messagesSnapshot
+              .slice()
+              .reverse()
+              .find((m) => (m as AgentMessage)?.role === "assistant") as
+              | AssistantMessage
+              | undefined;
+
+            const usage = lastAssistant?.usage;
+            const agentMeta: EmbeddedPiAgentMeta = {
+              sessionId: sessionIdUsed,
+              provider: lastAssistant?.provider ?? provider,
+              model: lastAssistant?.model ?? model.id,
+              usage: usage
+                ? {
+                    input: usage.input,
+                    output: usage.output,
+                    cacheRead: usage.cacheRead,
+                    cacheWrite: usage.cacheWrite,
+                    total: usage.totalTokens,
+                  }
+                : undefined,
+            };
+
+            const replyItems: Array<{ text: string; media?: string[] }> = [];
+
+            const errorText = lastAssistant
+              ? formatAssistantErrorText(lastAssistant)
+              : undefined;
+            if (errorText) replyItems.push({ text: errorText });
+
+            const inlineToolResults =
+              params.verboseLevel === "on" &&
+              !params.onPartialReply &&
+              !params.onToolResult &&
+              toolMetas.length > 0;
+            if (inlineToolResults) {
+              for (const { toolName, meta } of toolMetas) {
+                const agg = formatToolAggregate(toolName, meta ? [meta] : []);
+                const { text: cleanedText, mediaUrls } = splitMediaFromOutput(agg);
+                if (cleanedText)
+                  replyItems.push({ text: cleanedText, media: mediaUrls });
+              }
+            }
+
+            for (const text of assistantTexts.length
+              ? assistantTexts
+              : lastAssistant
+                ? [extractAssistantText(lastAssistant)]
+                : []) {
+              const { text: cleanedText, mediaUrls } = splitMediaFromOutput(text);
+              if (!cleanedText && (!mediaUrls || mediaUrls.length === 0)) continue;
               replyItems.push({ text: cleanedText, media: mediaUrls });
+            }
+
+            const payloads = replyItems
+              .map((item) => ({
+                text: item.text?.trim() ? item.text.trim() : undefined,
+                mediaUrls: item.media?.length ? item.media : undefined,
+                mediaUrl: item.media?.[0],
+              }))
+              .filter(
+                (p) =>
+                  p.text || p.mediaUrl || (p.mediaUrls && p.mediaUrls.length > 0),
+              );
+
+            log.debug(
+              `embedded run done: runId=${params.runId} sessionId=${params.sessionId} durationMs=${Date.now() - started} aborted=${aborted}`,
+            );
+            return {
+              payloads: payloads.length ? payloads : undefined,
+              meta: {
+                durationMs: Date.now() - started,
+                agentMeta,
+                aborted,
+              },
+            };
+          } catch (err) {
+            // Only retry for activity timeout errors (silent rate-limits)
+            const isRetryable = err instanceof AntigravityActivityTimeoutError;
+            const hasMoreAttempts = attempt < maxRetries - 1;
+
+            if (isRetryable && hasMoreAttempts) {
+              log.warn(
+                `embedded run activity timeout, will retry: runId=${params.runId} attempt=${attempt + 1}/${maxRetries}`,
+              );
+              lastRetryError = err;
+              continue;
+            }
+
+            // Non-retryable error or no more attempts - rethrow
+            throw err;
           }
         }
 
-        for (const text of assistantTexts.length
-          ? assistantTexts
-          : lastAssistant
-            ? [extractAssistantText(lastAssistant)]
-            : []) {
-          const { text: cleanedText, mediaUrls } = splitMediaFromOutput(text);
-          if (!cleanedText && (!mediaUrls || mediaUrls.length === 0)) continue;
-          replyItems.push({ text: cleanedText, media: mediaUrls });
-        }
-
-        const payloads = replyItems
-          .map((item) => ({
-            text: item.text?.trim() ? item.text.trim() : undefined,
-            mediaUrls: item.media?.length ? item.media : undefined,
-            mediaUrl: item.media?.[0],
-          }))
-          .filter(
-            (p) =>
-              p.text || p.mediaUrl || (p.mediaUrls && p.mediaUrls.length > 0),
-          );
-
-        log.debug(
-          `embedded run done: runId=${params.runId} sessionId=${params.sessionId} durationMs=${Date.now() - started} aborted=${aborted}`,
-        );
-        return {
-          payloads: payloads.length ? payloads : undefined,
-          meta: {
-            durationMs: Date.now() - started,
-            agentMeta,
-            aborted,
-          },
-        };
+        // Should not reach here if loop completed normally (returns inside loop)
+        // This handles the case where all retries failed
+        throw lastRetryError ?? new Error("All Antigravity retry attempts exhausted");
       } finally {
         restoreSkillEnv?.();
         process.chdir(prevCwd);

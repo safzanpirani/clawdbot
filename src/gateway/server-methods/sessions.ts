@@ -456,7 +456,17 @@ export const sessionsHandlers: GatewayRequestHandlers = {
     }
 
     const archived = archiveFileOnDisk(filePath, "bak");
-    const keptLines = lines.slice(-maxLines);
+
+    const firstLine = lines[0];
+    const isSessionHeader =
+      firstLine.includes('"type":"session"') ||
+      firstLine.includes('"type": "session"');
+    const messageLines = isSessionHeader ? lines.slice(1) : lines;
+    const keptMessageLines = messageLines.slice(-maxLines);
+    const keptLines = isSessionHeader
+      ? [firstLine, ...keptMessageLines]
+      : keptMessageLines;
+
     fs.writeFileSync(filePath, `${keptLines.join("\n")}\n`, "utf-8");
 
     if (store[key]) {

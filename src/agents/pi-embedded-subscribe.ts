@@ -105,6 +105,7 @@ export function subscribeEmbeddedPiSession(params: {
     data: Record<string, unknown>;
   }) => void;
   enforceFinalTag?: boolean;
+  onActivity?: () => void;
 }) {
   const assistantTexts: string[] = [];
   const toolMetas: Array<{ toolName?: string; meta?: string }> = [];
@@ -231,6 +232,9 @@ export function subscribeEmbeddedPiSession(params: {
 
   const unsubscribe = params.session.subscribe(
     (evt: AgentEvent | { type: string; [k: string]: unknown }) => {
+      // Track activity for timeout detection (Antigravity silent rate-limits)
+      params.onActivity?.();
+
       if (evt.type === "message_start") {
         const msg = (evt as AgentEvent & { message: AgentMessage }).message;
         if (msg?.role === "assistant") {
