@@ -236,9 +236,24 @@ const ExecutableTokenSchema = z
   .string()
   .refine(isSafeExecutableValue, "expected safe executable name or path");
 
+const DeepgramTranscriptionSchema = z
+  .object({
+    apiKey: z.string().optional(),
+    model: z.string().optional(),
+    language: z.string().optional(),
+    detectLanguage: z.boolean().optional(),
+    punctuate: z.boolean().optional(),
+    smartFormat: z.boolean().optional(),
+  })
+  .optional();
+
 const ToolsAudioTranscriptionSchema = z
   .object({
+    provider: z
+      .union([z.literal("command"), z.literal("deepgram"), z.literal("openai")])
+      .optional(),
     args: z.array(z.string()).optional(),
+    deepgram: DeepgramTranscriptionSchema,
     timeoutSeconds: z.number().int().positive().optional(),
   })
   .optional();

@@ -957,15 +957,29 @@ export type AgentToolsConfig = {
   };
 };
 
+export type TranscriptionProvider = "command" | "deepgram" | "openai";
+
+export type DeepgramTranscriptionConfig = {
+  apiKey?: string;
+  model?: string;
+  language?: string;
+  detectLanguage?: boolean;
+  punctuate?: boolean;
+  smartFormat?: boolean;
+};
+
+export type TranscriptionConfig = {
+  provider?: TranscriptionProvider;
+  args?: string[];
+  deepgram?: DeepgramTranscriptionConfig;
+  timeoutSeconds?: number;
+};
+
 export type ToolsConfig = {
   allow?: string[];
   deny?: string[];
   audio?: {
-    transcription?: {
-      /** CLI args (template-enabled). */
-      args?: string[];
-      timeoutSeconds?: number;
-    };
+    transcription?: TranscriptionConfig;
   };
   agentToAgent?: {
     /** Enable agent-to-agent messaging tools. Default: false. */

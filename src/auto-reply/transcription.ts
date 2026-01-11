@@ -8,6 +8,7 @@ import { logVerbose, shouldLogVerbose } from "../globals.js";
 import { runExec } from "../process/exec.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { applyTemplate, type MsgContext } from "./templating.js";
+import { transcribeWithDeepgram } from "./transcription-deepgram.js";
 
 const AUDIO_TRANSCRIPTION_BINARY = "whisper";
 
@@ -16,7 +17,16 @@ export function isAudio(mediaType?: string | null) {
 }
 
 export function hasAudioTranscriptionConfig(cfg: ClawdbotConfig): boolean {
-  if (cfg.tools?.audio?.transcription?.args?.length) return true;
+  const transcription = cfg.tools?.audio?.transcription;
+  if (transcription) {
+    if (transcription.args?.length) return true;
+    if (transcription.provider === "deepgram") {
+      return Boolean(
+        transcription.deepgram?.apiKey || process.env.DEEPGRAM_API_KEY,
+      );
+    }
+    if (transcription.provider === "openai") return true;
+  }
   return Boolean(cfg.audio?.transcription?.command?.length);
 }
 
@@ -27,7 +37,13 @@ export async function transcribeInboundAudio(
 ): Promise<{ text: string } | undefined> {
   const toolTranscriber = cfg.tools?.audio?.transcription;
   const legacyTranscriber = cfg.audio?.transcription;
-  const hasToolTranscriber = Boolean(toolTranscriber?.args?.length);
+
+  const provider = toolTranscriber?.provider ?? "command";
+  const hasToolTranscriber =
+    provider === "deepgram" ||
+    provider === "openai" ||
+    Boolean(toolTranscriber?.args?.length);
+
   if (!hasToolTranscriber && !legacyTranscriber?.command?.length) {
     return undefined;
   }
@@ -38,8 +54,10 @@ export async function transcribeInboundAudio(
       45) * 1000,
     1_000,
   );
+
   let tmpPath: string | undefined;
   let mediaPath = ctx.MediaPath;
+
   try {
     if (!mediaPath && ctx.MediaUrl) {
       const res = await fetch(ctx.MediaUrl);
@@ -60,24 +78,40 @@ export async function transcribeInboundAudio(
     }
     if (!mediaPath) return undefined;
 
-    const templCtx: MsgContext = { ...ctx, MediaPath: mediaPath };
-    const argv = hasToolTranscriber
-      ? [AUDIO_TRANSCRIPTION_BINARY, ...(toolTranscriber?.args ?? [])].map(
-          (part, index) => (index === 0 ? part : applyTemplate(part, templCtx)),
-        )
-      : (legacyTranscriber?.command ?? []).map((part) =>
-          applyTemplate(part, templCtx),
+    switch (provider) {
+      case "deepgram":
+        return await transcribeWithDeepgram(
+          mediaPath,
+          toolTranscriber?.deepgram,
+          timeoutMs,
         );
-    if (shouldLogVerbose()) {
-      logVerbose(`Transcribing audio via command: ${argv.join(" ")}`);
+
+      case "openai":
+        runtime.error?.("OpenAI transcription provider not yet implemented");
+        return undefined;
+
+      default: {
+        const templCtx: MsgContext = { ...ctx, MediaPath: mediaPath };
+        const argv = toolTranscriber?.args?.length
+          ? [AUDIO_TRANSCRIPTION_BINARY, ...(toolTranscriber.args ?? [])].map(
+              (part, index) =>
+                index === 0 ? part : applyTemplate(part, templCtx),
+            )
+          : (legacyTranscriber?.command ?? []).map((part) =>
+              applyTemplate(part, templCtx),
+            );
+        if (shouldLogVerbose()) {
+          logVerbose(`Transcribing audio via command: ${argv.join(" ")}`);
+        }
+        const { stdout } = await runExec(argv[0], argv.slice(1), {
+          timeoutMs,
+          maxBuffer: 5 * 1024 * 1024,
+        });
+        const text = stdout.trim();
+        if (!text) return undefined;
+        return { text };
+      }
     }
-    const { stdout } = await runExec(argv[0], argv.slice(1), {
-      timeoutMs,
-      maxBuffer: 5 * 1024 * 1024,
-    });
-    const text = stdout.trim();
-    if (!text) return undefined;
-    return { text };
   } catch (err) {
     runtime.error?.(`Audio transcription failed: ${String(err)}`);
     return undefined;
