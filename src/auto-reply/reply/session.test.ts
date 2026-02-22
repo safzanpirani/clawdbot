@@ -300,6 +300,41 @@ describe("initSessionState thread forking", () => {
     expect(result.sessionEntry.sessionFile).not.toBe(parentSessionFile);
   });
 
+  it("falls back to a fresh session when parent sessionFile is outside sessions dir", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-thread-session-outside-"));
+    const storePath = path.join(root, "sessions.json");
+    const parentSessionKey = "agent:main:slack:channel:c1";
+    const parentSessionId = "parent-session";
+    const outsideParentPath = path.join(os.tmpdir(), "openclaw-parent-outside.jsonl");
+
+    await saveSessionStore(storePath, {
+      [parentSessionKey]: {
+        sessionId: parentSessionId,
+        sessionFile: outsideParentPath,
+        updatedAt: Date.now(),
+      },
+    });
+
+    const cfg = {
+      session: { store: storePath },
+    } as OpenClawConfig;
+
+    const threadSessionKey = "agent:main:slack:channel:c1:thread:outside";
+    const result = await initSessionState({
+      ctx: {
+        Body: "Thread reply",
+        SessionKey: threadSessionKey,
+        ParentSessionKey: parentSessionKey,
+      },
+      cfg,
+      commandAuthorized: true,
+    });
+
+    expect(result.sessionKey).toBe(threadSessionKey);
+    expect(result.sessionEntry.sessionId).not.toBe(parentSessionId);
+    expect(result.sessionEntry.sessionFile).toBeTruthy();
+  });
+
   it("respects session.parentForkMaxTokens override", async () => {
     const root = await makeCaseDir("openclaw-thread-session-overflow-override-");
     const sessionsDir = path.join(root, "sessions");
@@ -398,6 +433,40 @@ describe("initSessionState thread forking", () => {
     expect(path.basename(sessionFile ?? "")).toBe(
       `${result.sessionEntry.sessionId}-topic-456.jsonl`,
     );
+  });
+
+  it("rewrites stale absolute session files outside store sessions dir", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-stale-session-file-"));
+    const storePath = path.join(root, "sessions.json");
+    const sessionKey = "agent:main:whatsapp:group:120363046755469895@g.us";
+    const sessionId = "stale-session-id";
+
+    await saveSessionStore(storePath, {
+      [sessionKey]: {
+        sessionId,
+        sessionFile: path.join(os.tmpdir(), "legacy", "outside.jsonl"),
+        updatedAt: Date.now(),
+      },
+    });
+
+    const cfg = {
+      session: { store: storePath },
+    } as OpenClawConfig;
+
+    const result = await initSessionState({
+      ctx: {
+        Body: "hello",
+        SessionKey: sessionKey,
+        ChatType: "group",
+      },
+      cfg,
+      commandAuthorized: true,
+    });
+
+    expect(result.isNewSession).toBe(false);
+    expect(result.sessionEntry.sessionId).toBe(sessionId);
+    expect(path.dirname(result.sessionEntry.sessionFile ?? "")).toBe(root);
+    expect(path.basename(result.sessionEntry.sessionFile ?? "")).toBe(`${sessionId}.jsonl`);
   });
 });
 
