@@ -6,6 +6,7 @@ import * as bootstrapCache from "../../agents/bootstrap-cache.js";
 import { buildModelAliasIndex } from "../../agents/model-selection.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import type { SessionEntry } from "../../config/sessions.js";
+import { saveSessionStore } from "../../config/sessions.js";
 import { formatZonedTimestamp } from "../../infra/format-time/format-datetime.ts";
 import {
   __testing as sessionBindingTesting,
@@ -465,8 +466,48 @@ describe("initSessionState thread forking", () => {
 
     expect(result.isNewSession).toBe(false);
     expect(result.sessionEntry.sessionId).toBe(sessionId);
-    expect(path.dirname(result.sessionEntry.sessionFile ?? "")).toBe(root);
+    const resolvedRoot = await fs.realpath(root);
+    const resolvedSessionDir = await fs.realpath(
+      path.dirname(result.sessionEntry.sessionFile ?? ""),
+    );
+    expect(resolvedSessionDir).toBe(resolvedRoot);
     expect(path.basename(result.sessionEntry.sessionFile ?? "")).toBe(`${sessionId}.jsonl`);
+  });
+
+  it("keeps existing sessions usable when legacy sessionId is invalid but sessionFile is valid", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-legacy-invalid-session-id-"));
+    const storePath = path.join(root, "sessions.json");
+    const sessionKey = "agent:main:slack:channel:c1";
+    const legacyInvalidSessionId = "legacy/invalid";
+    const existingSessionFile = path.join(root, "legacy-session.jsonl");
+
+    await fs.writeFile(existingSessionFile, '{"type":"session","id":"legacy/invalid"}\n', "utf-8");
+    await saveSessionStore(storePath, {
+      [sessionKey]: {
+        sessionId: legacyInvalidSessionId,
+        sessionFile: existingSessionFile,
+        updatedAt: Date.now(),
+      },
+    });
+
+    const cfg = {
+      session: { store: storePath },
+    } as OpenClawConfig;
+
+    const result = await initSessionState({
+      ctx: {
+        Body: "hello",
+        SessionKey: sessionKey,
+      },
+      cfg,
+      commandAuthorized: true,
+    });
+
+    expect(result.isNewSession).toBe(false);
+    expect(result.sessionEntry.sessionId).toBe(legacyInvalidSessionId);
+    const resolvedExpectedFile = await fs.realpath(existingSessionFile);
+    const resolvedSessionFile = await fs.realpath(result.sessionEntry.sessionFile ?? "");
+    expect(resolvedSessionFile).toBe(resolvedExpectedFile);
   });
 });
 
